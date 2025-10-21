@@ -68,6 +68,12 @@ async def whatsapp(request: Request):
     body = (form.get("Body", "") or "").strip()
     user = get_user(from_number)
 
+    if re.fullmatch(r"(ACEPTO|ACCEPT)", body, flags=re.I):
+        update_user(from_number, consent=1, step="chat")  # pasa a modo chat
+        user = get_user(from_number)
+        log_interaction(from_number, "assistant", "[accepted_any_state]")
+        return build_twiML(t(user, "accepted"))
+
     # ---- Comandos globales ----
     if re.fullmatch(r"(RESET|REINICIAR|NUEVO|START)", body, flags=re.I):
         update_user(from_number, consent=0, step="start", lang=DEFAULT_LANG)
