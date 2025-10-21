@@ -43,7 +43,20 @@ def healthz():
 @app.get("/health")
 def health():
     return {"ok": True, "ts": datetime.datetime.utcnow().isoformat()}
-
+    
+@app.get("/groq-test")
+async def groq_test():
+    msgs = [
+        {"role": "system", "content": 'Return JSON only: {"ok": true}.'},
+        {"role": "user", "content": 'Give me {"pong": true} as JSON only.'}
+    ]
+    try:
+        res = await chat_json(msgs, format_json=True)
+        return {"ok": True, "groq": res}
+    except Exception as e:
+        # no exponemos secretos; solo el mensaje de error
+        return {"ok": False, "error": str(e)}
+        
 @app.post("/whatsapp")
 async def whatsapp(request: Request):
     form = await request.form()
