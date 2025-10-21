@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: ophtha-chatbot-ollama-conversational
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OLLAMA_BASE_URL
+        value: https://your-ollama-host:11434
+      - key: OLLAMA_MODEL
+        value: llama3.2:3b
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
+      - key: DEFAULT_LANG
+        value: es
+      - key: MAX_WORDS
+        value: "120"

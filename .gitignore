@@ -1,0 +1,22 @@
+﻿# Entorno / secretos
+.env
+.env.*
+*.key
+*.pem
+
+# Bases de datos/local
+data.db
+*.sqlite
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+
+# OS/IDE
+.DS_Store
+.vscode/
