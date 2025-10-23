@@ -19,7 +19,15 @@ DEFAULT_LANG = os.getenv("DEFAULT_LANG", "es").lower()
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 
 def t(user, key):
+    """Traducción básica (ES/EN)."""
     return (EN if (user.get("lang", "es") == "en") else ES)[key]
+
+def t_fallback(user, key, default_text):
+    """Traducción con fallback: si la clave no existe en i18n, usa default_text."""
+    try:
+        return t(user, key)
+    except KeyError:
+        return default_text
 
 def build_twiML(message: str) -> PlainTextResponse:
     resp = MessagingResponse()
@@ -43,7 +51,7 @@ def healthz():
 @app.get("/health")
 def health():
     return {"ok": True, "ts": datetime.datetime.utcnow().isoformat()}
-    
+
 @app.get("/groq-test")
 async def groq_test():
     msgs = [
@@ -56,7 +64,7 @@ async def groq_test():
     except Exception as e:
         # no exponemos secretos; solo el mensaje de error
         return {"ok": False, "error": str(e)}
-        
+
 @app.post("/whatsapp")
 async def whatsapp(request: Request):
     form = await request.form()
@@ -68,15 +76,17 @@ async def whatsapp(request: Request):
     body = (form.get("Body", "") or "").strip()
     user = get_user(from_number)
 
+    # --- ACEPTAR en cualquier estado (respuesta inmediata) ---
     if re.fullmatch(r"(ACEPTO|ACCEPT)", body, flags=re.I):
         update_user(from_number, consent=1, step="chat")  # pasa a modo chat
         user = get_user(from_number)
         log_interaction(from_number, "assistant", "[accepted_any_state]")
         return build_twiML(t(user, "accepted"))
+    # ---------------------------------------------------------
 
     # ---- Comandos globales ----
     if re.fullmatch(r"(RESET|REINICIAR|NUEVO|START)", body, flags=re.I):
-        update_user(from_number, consent=0, step="start", lang=DEFAULT_LANG)
+        update_user(from_number, consent=0, step="start", lang=DEFAULT_LANG, temp_name=None)
         user = get_user(from_number)
         msg = f"{t(user,'welcome')}\n\n{t(user,'disclaimer')}\n\n{t(user,'lang_hint')}"
         return build_twiML(msg)
@@ -107,47 +117,76 @@ async def whatsapp(request: Request):
     if not ok:
         return build_twiML("Has superado el límite de mensajes por minuto. Intenta en unos segundos.")
 
-    # ---- Hotfix A: NO cambiar a schedule automático ----
-    # Detección de intención de agendar ANTES de llamar a la IA
-    if re.search(r"\b(cita|agendar|agenda|appointment|schedule)\b", body, flags=re.I):
-        update_user(from_number, step="schedule")
-        return build_twiML(t(user, "schedule_ask"))
+    # =========================
+    # AGENDA SOLO A PEDIDO
+    # =========================
 
-    # ---- Estado schedule (solo si el usuario lo pidió) ----
-    if user["step"] == "schedule":
-        # Usuario no quiere agendar ahora -> volver a chat
+    # 0) Disparador explícito de agenda -> Paso 1: nombre y apellido
+    if re.search(r"\b(cita|agendar|agenda|appointment|schedule)\b", body, flags=re.I):
+        update_user(from_number, step="schedule_name", temp_name=None)
+        msg_name = t_fallback(
+            user,
+            "schedule_ask",
+            "Perfecto, para agendar necesito primero tu *nombre y apellido*. "
+            "Escríbelos tal como figuran en tu documento."
+        )
+        return build_twiML(msg_name)
+
+    # 1) Paso 1: capturar nombre y apellido
+    if user["step"] == "schedule_name":
+        name = body.strip()
+        # Validación simple: al menos 2 palabras
+        if len(name.split()) < 2 or len(name) < 3:
+            return build_twiML("Por favor envía *nombre y apellido* (ej. Ana Pérez).")
+        update_user(from_number, temp_name=name, step="schedule_datetime")
+        msg_dt = t_fallback(
+            user,
+            "schedule_ask_datetime",
+            "Gracias. Ahora indícame *fecha y hora* (ej. 2025-11-05 15:30) y una *nota breve* (motivo)."
+        )
+        return build_twiML(msg_dt)
+
+    # 2) Paso 2: capturar fecha/hora + nota y guardar cita
+    if user["step"] == "schedule_datetime":
+        # Permitir cancelar (no agendar)
         if re.search(r"\b(no|no gracias|luego|despues|más tarde|mas tarde|no quiero)\b", body, flags=re.I):
-            update_user(from_number, step="chat")
+            update_user(from_number, temp_name=None, step="chat")
             return build_twiML("Sin problema. Cuéntame tus síntomas y te orientaré.")
 
-        # Si vuelve a pedir cita sin fecha, recuerda el formato
-        if re.search(r"\b(cita|agendar|appointment|schedule)\b", body, flags=re.I):
-            return build_twiML(t(user, "schedule_ask"))
+        import re as _re
+        m = _re.match(r"(?P<dt>\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?)\s*(?P<note>.*)", body)
+        if not m:
+            return build_twiML("Formato no reconocido. Ejemplo: 2025-11-05 15:30 dolor ocular desde ayer.")
 
-        # Formato fecha/hora simple
-        m = re.match(r"(?P<dt>\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?)\s*(?P<note>.*)", body)
-        if m:
-            preferred = m.group("dt")
-            note = (m.group("note") or "")[:200]
-            add_appointment(user["phone"], preferred=preferred, note=note)
-            update_user(from_number, step="chat")
-            return build_twiML(t(user, "scheduled"))
+        preferred = m.group("dt")
+        note = (m.group("note") or "")[:200]
 
-        # Si no reconoce fecha, sigue conversando con IA
-        log_interaction(from_number, "user", body)
-        result = await make_reply(chat_json, user, body)
-        reply_text = result["response"]
-        log_interaction(from_number, "assistant", reply_text)
-        return build_twiML(reply_text)
+        # Recuperar el nombre capturado en el paso 1
+        u = get_user(from_number)
+        full_name = u.get("temp_name") or ""
 
-    # ---- Chat conversacional (IA) ----
+        # Guardar cita
+        # Compatibilidad con firmas antiguas de add_appointment():
+        try:
+            # versión nueva: add_appointment(phone, full_name, preferred, note)
+            add_appointment(u["phone"], full_name=full_name, preferred=preferred, note=note)
+        except TypeError:
+            # versión vieja: add_appointment(phone, preferred, note) -> incluimos el nombre en la nota
+            combo_note = (full_name + " — " + note) if full_name else note
+            add_appointment(u["phone"], preferred=preferred, note=combo_note)
+
+        # Limpiar estado y volver a chat
+        update_user(from_number, temp_name=None, step="chat")
+        return build_twiML(t(u, "scheduled"))
+
+    # =========================
+    # CHAT CONVERSACIONAL (IA)
+    # =========================
     log_interaction(from_number, "user", body)
     result = await make_reply(chat_json, user, body)
     reply_text = result["response"]
 
-    # Hotfix A: NO cambiar a schedule por la respuesta de la IA
-    # (antes aquí había un update_user(..., step="schedule") automático)
-
+    # No pasar a 'schedule' automáticamente: solo a pedido del usuario
     log_interaction(from_number, "assistant", reply_text)
     return build_twiML(reply_text)
 
