@@ -1,15 +1,18 @@
 import os, re, datetime
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from dotenv import load_dotenv
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
-from db import init_db, get_user, update_user, log_interaction, add_appointment
+from db import (
+    init_db, get_user, update_user, log_interaction,
+    add_appointment, list_appointments
+)
 from utils import rate_limit
 from i18n import ES, EN
 from chat_logic import make_reply
-from ollama_client import chat_json  # ahora usa Groq por debajo
+from ollama_client import chat_json  # usa Groq por debajo si cambiaste el cliente
 
 load_dotenv()
 app = FastAPI(title="Ophthalmology WhatsApp Chatbot — Conversational")
@@ -17,13 +20,13 @@ init_db()
 
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "es").lower()
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+ADMIN_SECRET = os.getenv("APPOINTMENTS_SECRET", "")
+ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "")
 
 def t(user, key):
-    """Traducción básica (ES/EN)."""
     return (EN if (user.get("lang", "es") == "en") else ES)[key]
 
 def t_fallback(user, key, default_text):
-    """Traducción con fallback: si la clave no existe en i18n, usa default_text."""
     try:
         return t(user, key)
     except KeyError:
@@ -62,8 +65,13 @@ async def groq_test():
         res = await chat_json(msgs, format_json=True)
         return {"ok": True, "groq": res}
     except Exception as e:
-        # no exponemos secretos; solo el mensaje de error
         return {"ok": False, "error": str(e)}
+
+@app.get("/admin/appointments")
+def admin_appointments(secret: str = ""):
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return JSONResponse({"appointments": list_appointments(100)})
 
 @app.post("/whatsapp")
 async def whatsapp(request: Request):
@@ -78,11 +86,24 @@ async def whatsapp(request: Request):
 
     # --- ACEPTAR en cualquier estado (respuesta inmediata) ---
     if re.fullmatch(r"(ACEPTO|ACCEPT)", body, flags=re.I):
-        update_user(from_number, consent=1, step="chat")  # pasa a modo chat
+        update_user(from_number, consent=1, step="chat")
         user = get_user(from_number)
         log_interaction(from_number, "assistant", "[accepted_any_state]")
         return build_twiML(t(user, "accepted"))
     # ---------------------------------------------------------
+
+    # --- Admin por WhatsApp: lista de citas (solo tu número) ---
+    if from_number == ADMIN_WHATSAPP and re.fullmatch(r"(LISTA\s+CITAS|CITAS)", body, flags=re.I):
+        items = list_appointments(10)
+        if not items:
+            return build_twiML("No hay citas registradas.")
+        lines = [
+            f"#{it.get('id')} {it.get('preferred') or '(sin fecha)'} – {it.get('full_name') or 'N/D'} – "
+            f"{it.get('phone')} – {(it.get('note') or '')[:40]}"
+            for it in items
+        ]
+        return build_twiML("Últimas citas:\n" + "\n".join(lines))
+    # ------------------------------------------------------------
 
     # ---- Comandos globales ----
     if re.fullmatch(r"(RESET|REINICIAR|NUEVO|START)", body, flags=re.I):
@@ -165,17 +186,15 @@ async def whatsapp(request: Request):
         u = get_user(from_number)
         full_name = u.get("temp_name") or ""
 
-        # Guardar cita
-        # Compatibilidad con firmas antiguas de add_appointment():
+        # Guardar cita (soporta firmas vieja/nueva)
         try:
-            # versión nueva: add_appointment(phone, full_name, preferred, note)
+            # Nueva firma: add_appointment(phone, full_name, preferred, note)
             add_appointment(u["phone"], full_name=full_name, preferred=preferred, note=note)
         except TypeError:
-            # versión vieja: add_appointment(phone, preferred, note) -> incluimos el nombre en la nota
+            # Vieja firma: add_appointment(phone, preferred, note) -> inyecta el nombre en la nota
             combo_note = (full_name + " — " + note) if full_name else note
             add_appointment(u["phone"], preferred=preferred, note=combo_note)
 
-        # Limpiar estado y volver a chat
         update_user(from_number, temp_name=None, step="chat")
         return build_twiML(t(u, "scheduled"))
 
@@ -186,7 +205,7 @@ async def whatsapp(request: Request):
     result = await make_reply(chat_json, user, body)
     reply_text = result["response"]
 
-    # No pasar a 'schedule' automáticamente: solo a pedido del usuario
+    # No pasar a 'schedule' automáticamente (solo a pedido)
     log_interaction(from_number, "assistant", reply_text)
     return build_twiML(reply_text)
 
