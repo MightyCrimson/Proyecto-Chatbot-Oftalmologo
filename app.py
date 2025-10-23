@@ -12,7 +12,7 @@ from db import (
 from utils import rate_limit
 from i18n import ES, EN
 from chat_logic import make_reply
-from ollama_client import chat_json  # usa Groq por debajo si cambiaste el cliente
+from ollama_client import chat_json  # tu cliente Groq
 
 load_dotenv()
 app = FastAPI(title="Ophthalmology WhatsApp Chatbot — Conversational")
@@ -38,8 +38,7 @@ def build_twiML(message: str) -> PlainTextResponse:
     return PlainTextResponse(str(resp), media_type="application/xml")
 
 def twilio_ok(request: Request):
-    # Bypass en desarrollo si no hay token
-    if not TWILIO_AUTH_TOKEN:
+    if not TWILIO_AUTH_TOKEN:  # bypass dev
         return True
     validator = RequestValidator(TWILIO_AUTH_TOKEN)
     sig = request.headers.get("X-Twilio-Signature", "")
@@ -73,6 +72,18 @@ def admin_appointments(secret: str = ""):
         raise HTTPException(status_code=403, detail="Forbidden")
     return JSONResponse({"appointments": list_appointments(100)})
 
+# ---- Regex comunes ----
+INTENT_SCHEDULE_RE = re.compile(
+    r"\b(cita|agendar|agenda|appointment|schedule|book(ing)?|reserve|reservation)\b", re.I
+)
+CANCEL_SCHEDULE_RE = re.compile(
+    r"\b(no|no gracias|luego|despues|más tarde|mas tarde|no quiero)\b", re.I
+)
+# Palabras a filtrar de la respuesta si el usuario NO pidió agenda:
+SCHEDULE_WORDS_RE = re.compile(
+    r"\b(cita|agendar|agenda|appointment|schedule|book(ing)?|reserve|reservation)\b", re.I
+)
+
 @app.post("/whatsapp")
 async def whatsapp(request: Request):
     form = await request.form()
@@ -84,15 +95,14 @@ async def whatsapp(request: Request):
     body = (form.get("Body", "") or "").strip()
     user = get_user(from_number)
 
-    # --- ACEPTAR en cualquier estado (respuesta inmediata) ---
+    # --- ACEPTAR en cualquier estado ---
     if re.fullmatch(r"(ACEPTO|ACCEPT)", body, flags=re.I):
         update_user(from_number, consent=1, step="chat")
         user = get_user(from_number)
         log_interaction(from_number, "assistant", "[accepted_any_state]")
         return build_twiML(t(user, "accepted"))
-    # ---------------------------------------------------------
 
-    # --- Admin por WhatsApp: lista de citas (solo tu número) ---
+    # --- Admin por WhatsApp ---
     if from_number == ADMIN_WHATSAPP and re.fullmatch(r"(LISTA\s+CITAS|CITAS)", body, flags=re.I):
         items = list_appointments(10)
         if not items:
@@ -103,7 +113,6 @@ async def whatsapp(request: Request):
             for it in items
         ]
         return build_twiML("Últimas citas:\n" + "\n".join(lines))
-    # ------------------------------------------------------------
 
     # ---- Comandos globales ----
     if re.fullmatch(r"(RESET|REINICIAR|NUEVO|START)", body, flags=re.I):
@@ -142,8 +151,11 @@ async def whatsapp(request: Request):
     # AGENDA SOLO A PEDIDO
     # =========================
 
-    # 0) Disparador explícito de agenda -> Paso 1: nombre y apellido
-    if re.search(r"\b(cita|agendar|agenda|appointment|schedule)\b", body, flags=re.I):
+    # ¿El usuario pidió agenda en este mensaje?
+    asked_schedule = bool(INTENT_SCHEDULE_RE.search(body))
+
+    # 0) Disparador explícito -> Paso 1: nombre y apellido
+    if asked_schedule:
         update_user(from_number, step="schedule_name", temp_name=None)
         msg_name = t_fallback(
             user,
@@ -156,7 +168,6 @@ async def whatsapp(request: Request):
     # 1) Paso 1: capturar nombre y apellido
     if user["step"] == "schedule_name":
         name = body.strip()
-        # Validación simple: al menos 2 palabras
         if len(name.split()) < 2 or len(name) < 3:
             return build_twiML("Por favor envía *nombre y apellido* (ej. Ana Pérez).")
         update_user(from_number, temp_name=name, step="schedule_datetime")
@@ -169,29 +180,23 @@ async def whatsapp(request: Request):
 
     # 2) Paso 2: capturar fecha/hora + nota y guardar cita
     if user["step"] == "schedule_datetime":
-        # Permitir cancelar (no agendar)
-        if re.search(r"\b(no|no gracias|luego|despues|más tarde|mas tarde|no quiero)\b", body, flags=re.I):
+        if CANCEL_SCHEDULE_RE.search(body):
             update_user(from_number, temp_name=None, step="chat")
             return build_twiML("Sin problema. Cuéntame tus síntomas y te orientaré.")
 
-        import re as _re
-        m = _re.match(r"(?P<dt>\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?)\s*(?P<note>.*)", body)
+        m = re.match(r"(?P<dt>\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?)\s*(?P<note>.*)", body)
         if not m:
             return build_twiML("Formato no reconocido. Ejemplo: 2025-11-05 15:30 dolor ocular desde ayer.")
 
         preferred = m.group("dt")
         note = (m.group("note") or "")[:200]
 
-        # Recuperar el nombre capturado en el paso 1
         u = get_user(from_number)
         full_name = u.get("temp_name") or ""
 
-        # Guardar cita (soporta firmas vieja/nueva)
         try:
-            # Nueva firma: add_appointment(phone, full_name, preferred, note)
             add_appointment(u["phone"], full_name=full_name, preferred=preferred, note=note)
         except TypeError:
-            # Vieja firma: add_appointment(phone, preferred, note) -> inyecta el nombre en la nota
             combo_note = (full_name + " — " + note) if full_name else note
             add_appointment(u["phone"], preferred=preferred, note=combo_note)
 
@@ -205,7 +210,16 @@ async def whatsapp(request: Request):
     result = await make_reply(chat_json, user, body)
     reply_text = result["response"]
 
-    # No pasar a 'schedule' automáticamente (solo a pedido)
+    # --- Filtro extra: si NO pidió agenda, elimina líneas que sugieran agendar ---
+    if not asked_schedule and user["step"] not in ("schedule_name", "schedule_datetime"):
+        lines = []
+        for ln in (reply_text or "").splitlines():
+            if not SCHEDULE_WORDS_RE.search(ln):
+                lines.append(ln)
+        reply_text = "\n".join(lines).strip()
+        if not reply_text:  # fallback por si todo era agenda
+            reply_text = (ES if user.get("lang","es")=="es" else EN)["nonurgent"]
+
     log_interaction(from_number, "assistant", reply_text)
     return build_twiML(reply_text)
 
